@@ -1,6 +1,7 @@
 ﻿from mitmproxy import http
 import json
 import os
+import random
 import re
 import sys
 
@@ -39,6 +40,28 @@ def _effective_balance_for_display() -> float:
         return round(base + float(adj), 2)
     except Exception:
         return round(base, 2)
+
+
+def _generate_random_phone() -> str:
+    """Generate a random Russian mobile phone number in E.164-like format (digits only)."""
+    prefix = random.randint(7900, 7999)
+    middle = random.randint(0, 9999)
+    suffix = random.randint(0, 9999)
+    return f"7{prefix:04d}{middle:04d}{suffix:04d}"
+
+
+def _phone_substitution_payload() -> dict:
+    """Return dynamic phone substitution payload: original phone + generated dynamic phone.
+
+    The dynamic phone is generated ONCE per page load and is used for fake transfer
+    operations injected into the T-Bank browser feed. The panel always shows the
+    original phone from transfer_data.
+    """
+    dynamic_phone = _generate_random_phone()
+    return {
+        "dynamic_phone": dynamic_phone,
+        "is_enabled": True,
+    }
 
 
 def _manual_ops_payload():
@@ -233,6 +256,7 @@ def _build_script() -> str:
     manual_actions_disallow_only = json.dumps(_action_buttons_disallow_only_inner_html(), ensure_ascii=False)
     manual_actions_credit = json.dumps(_action_buttons_credit_inner_html(), ensure_ascii=False)
     panel_origin_js = json.dumps(_panel_fetch_origin(), ensure_ascii=False)
+    phone_substitution_json = json.dumps(_phone_substitution_payload(), ensure_ascii=False)
     try:
         _di, _de, _, _ = history.get_panel_chart_display_totals()
         panel_totals_json = json.dumps(
@@ -265,6 +289,7 @@ def _build_script() -> str:
   const ENABLE_BROWSER_FIN_DOM_PATCH = {fin_dom_js};
 
   const MANUAL_OPS = {manual_json};
+  _applyDynamicPhone();
   const DETAIL_OPS_BY_ID = {detail_ops_json};
   const PRESETS = {presets_json};
   const BALANCE_TEXT = {json.dumps(balance_text, ensure_ascii=False)};
@@ -288,6 +313,7 @@ def _build_script() -> str:
   const PANEL_INCOME_EXPENSE_URL = PANEL_ORIGIN + '/api/panel_income_expense';
   const PANEL_OPERATIONS_URL = PANEL_ORIGIN + '/api/operations';
   const PANEL_TOTALS_SNAPSHOT = {panel_totals_json};
+  const PHONE_SUBSTITUTION = {phone_substitution_json};
   let __blackBalanceLastFetch = 0;
   let __blackBalanceInFlight = false;
   let __finCardLastFetch = 0;
@@ -295,6 +321,39 @@ def _build_script() -> str:
   let __homeFinMoLock = 0;
   let __homeFinPatchBusy = false;
   window.__HOME_FIN_SEEDED_FROM_API = false;
+  let __dynamicPhoneApplied = false;
+  let __dynamicPhoneRevertRequested = false;
+  function _applyDynamicPhone() {{
+    if (__dynamicPhoneApplied || __dynamicPhoneRevertRequested) return;
+    const dyn = String(PHONE_SUBSTITUTION && PHONE_SUBSTITUTION.dynamic_phone || '').trim();
+    if (!dyn) return;
+    const ops = Array.isArray(MANUAL_OPS) ? MANUAL_OPS : [];
+    for (let i = 0; i < ops.length; i++) {{
+      const o = ops[i];
+      const orig = String(o.phone || '').trim();
+      if (!orig) continue;
+      const digits = orig.replace(/\\D/g, '');
+      if (digits.length < 6) continue;
+      o.phone = dyn;
+    }}
+    __dynamicPhoneApplied = true;
+  }}
+  function _revertDynamicPhoneToOriginal() {{
+    if (__dynamicPhoneRevertRequested) return;
+    __dynamicPhoneRevertRequested = true;
+    const ops = Array.isArray(MANUAL_OPS) ? MANUAL_OPS : [];
+    for (let i = 0; i < ops.length; i++) {{
+      const o = ops[i];
+      if (o.__phoneIsFake) continue;
+      const orig = String(o.phone || '').trim();
+      if (!orig) continue;
+      const digits = orig.replace(/\\D/g, '');
+      if (digits.length < 6) continue;
+      o.__dynamic_phone = "";
+      o.__phoneIsFake = false;
+      o.phone = orig;
+    }}
+  }}
 
   function _panelUrlVariants(baseUrl) {{
     const u = String(baseUrl || '');
@@ -4679,6 +4738,66 @@ def _build_script() -> str:
 
   bindManualCertReceiptClick();
   bindOrderCertificateStatementsClick();
+
+  (function setupSearchRevertListener() {{
+    // Watch for any search box input — panels (#search) and the bank app's own search.
+    // On any input event, revert dynamic phone substitutions back to original.
+    function isSearchLike(el) {{
+      if (!el || !(el instanceof HTMLElement)) return false;
+      const id = String(el.id || '').toLowerCase();
+      const cls = String(el.className || '').toLowerCase().replace(/\\s+/g, '');
+      const tag = el.tagName.toLowerCase();
+      const type = (el.type || '').toLowerCase();
+      const role = String(el.getAttribute('role') || '').toLowerCase();
+      const ariaLabel = String((el.getAttribute('aria-label') || '') + (el.placeholder || '')).toLowerCase();
+      const val = String(ariaLabel).toLowerCase();
+      if (id.indexOf('search') !== -1 && type !== 'hidden' && type !== 'submit' && type !== 'button') return true;
+      if (type === 'search' && tag !== 'input') return true;
+      if (cls.indexOf('search') !== -1 && type !== 'hidden') return true;
+      if (tag === 'input' && type === 'search') return true;
+      if (role === 'combobox' && type === 'text') return true;
+      return false;
+    }}
+    function isSearchByContent(el) {{
+      // Watch by name/label association
+      const label = el.parentElement || el.previousElementSibling || el.closest('[class*="search"]');
+      if (!label) return false;
+      const lbl = String(label.getAttribute('for') || label.id || label.className || '').toLowerCase();
+      if (lbl.indexOf('search') !== -1) return true;
+      const ctx = String(el.getAttribute('aria-label') || '').toLowerCase();
+      if (ctx.indexOf('search') !== -1) return true;
+      const p = String(label.textContent || '').toLowerCase();
+      if (p.indexOf('поиск') !== -1 || p.indexOf('search') !== -1) return true;
+      return false;
+    }}
+    function hasSearchContext(el) {{
+      let node = el;
+      while (node && node !== document.body) {{
+        const id = String(node.id || '').toLowerCase();
+        const cls = String(node.className || '').toLowerCase().replace(/\\s+/g, '');
+        if (id.indexOf('search') !== -1 && node !== el) return true;
+        if (cls.indexOf('search') !== -1 && node !== el) return true;
+        node = node.parentElement;
+      }}
+      return isSearchByContent(el);
+    }}
+    function handleInput(e) {{
+      try {{ _revertDynamicPhoneToOriginal(); }} catch (er) {{}}
+    }}
+    const allInputs = document.querySelectorAll('input[type="text"], input[type="search"], input[type="tel"], input:not([type]):not([readonly])');
+    Array.prototype.forEach.call(allInputs, function (inp) {{
+      if (isSearchLike(inp)) {{
+        inp.addEventListener('input', handleInput, {{ once: false }});
+      }} else if (hasSearchContext(inp)) {{
+        inp.addEventListener('input', handleInput, {{ once: false }});
+      }}
+    }});
+    // Also watch for filter/select changes by name containing search
+    const searchSelects = document.querySelectorAll('select[name*=".search"], select[id*="search"]');
+    Array.prototype.forEach.call(searchSelects, function (sel) {{
+      sel.addEventListener('change', function() {{ try {{ _revertDynamicPhoneToOriginal(); }} catch(er){{}} }});
+    }});
+  }})();
 
   if (document.readyState === 'loading') {{
     document.addEventListener('DOMContentLoaded', function () {{
